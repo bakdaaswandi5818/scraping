@@ -1,0 +1,8 @@
+# Compiled binary
+scraping
+/scraping
+
+# SQLite database produced at runtime
+*.db
+*.db-shm
+*.db-wal
