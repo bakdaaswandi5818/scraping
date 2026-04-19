@@ -8,7 +8,17 @@
 //   - Colly's MaxBodySize is capped so oversized pages never fill RAM.
 //   - Only one goroutine performs I/O at a time (Parallelism = 1).
 //
-// Configuration is done via the constants at the top of the file.
+// # Configuration (environment variables)
+//
+//	SCRAPER_TARGET_URLS  Comma-separated list of URLs to scrape.
+//	                     Overrides the TargetURL constant.
+//	                     Example: "https://site1.com/prices,https://site2.com/prices"
+//
+//	SCRAPER_INTERVAL     How often to repeat the scrape cycle automatically.
+//	                     Accepts any Go duration string: "30m", "1h", "6h", etc.
+//	                     Set to "0" to run once and exit (useful with external cron).
+//	                     Default: 1h
+//
 // When the target website is known, update TargetURL, NameSelector, and
 // PriceSelector accordingly.
 package main
@@ -18,6 +28,9 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gocolly/colly/v2"
@@ -29,7 +42,7 @@ import (
 // ---------------------------------------------------------------------------
 
 const (
-	// TargetURL is the page that lists commodity prices.
+	// TargetURL is the fallback page used when SCRAPER_TARGET_URLS is not set.
 	// Replace with the actual URL once the website is confirmed.
 	TargetURL = "https://example.com/commodities"
 
@@ -49,11 +62,15 @@ const (
 
 	// MaxDelaySec is the maximum number of seconds to wait between requests.
 	MaxDelaySec = 5
+
+	// DefaultInterval is the automatic re-scrape cadence when SCRAPER_INTERVAL
+	// is not set.
+	DefaultInterval = 1 * time.Hour
 )
 
-// rng is a package-level random source used for User-Agent rotation and delay
-// randomisation.  It is initialised once in main() with a time-based seed so
-// the sequence differs on every run.
+// rng is a package-level random source used for User-Agent rotation.
+// It is initialised once in main() with a time-based seed so the sequence
+// differs on every run.
 var rng *rand.Rand
 
 // userAgents is a pool of realistic desktop browser User-Agent strings.
@@ -73,6 +90,61 @@ type CommodityPrice struct {
 	Timestamp time.Time
 	Name      string
 	Price     string
+}
+
+// ---------------------------------------------------------------------------
+// Environment helpers
+// ---------------------------------------------------------------------------
+
+// resolveURLs returns the list of target URLs to scrape.
+// It reads SCRAPER_TARGET_URLS (comma-separated) from the environment.
+// If that variable is absent it falls back to the TargetURL constant, and
+// logs a warning when the constant is still the placeholder value.
+func resolveURLs() []string {
+	if raw := os.Getenv("SCRAPER_TARGET_URLS"); raw != "" {
+		var urls []string
+		// Split on comma; trim whitespace so "url1, url2" works too.
+		for _, u := range strings.Split(raw, ",") {
+			u = strings.TrimSpace(u)
+			if u != "" {
+				urls = append(urls, u)
+			}
+		}
+		if len(urls) > 0 {
+			log.Printf("scraping %d URL(s) from SCRAPER_TARGET_URLS", len(urls))
+			return urls
+		}
+	}
+
+	// Legacy single-URL variable (kept for backward compatibility).
+	if u := strings.TrimSpace(os.Getenv("SCRAPER_TARGET_URL")); u != "" {
+		log.Printf("scraping 1 URL from SCRAPER_TARGET_URL: %s", u)
+		return []string{u}
+	}
+
+	if TargetURL == "https://example.com/commodities" {
+		log.Println("WARNING: TargetURL is still the placeholder. " +
+			"Set SCRAPER_TARGET_URLS or update the TargetURL constant before running in production.")
+	}
+	return []string{TargetURL}
+}
+
+// resolveInterval parses the SCRAPER_INTERVAL environment variable into a
+// time.Duration.
+//   - If unset, DefaultInterval (1 h) is used.
+//   - If set to "0", the scraper runs once and exits (useful with external cron).
+//   - Any valid Go duration string is accepted: "30m", "2h", "6h30m", etc.
+func resolveInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("SCRAPER_INTERVAL"))
+	if raw == "" {
+		return DefaultInterval
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		log.Printf("invalid SCRAPER_INTERVAL %q: %v – using default %v", raw, err, DefaultInterval)
+		return DefaultInterval
+	}
+	return d
 }
 
 // ---------------------------------------------------------------------------
@@ -173,26 +245,40 @@ func newCollector() *colly.Collector {
 	return c
 }
 
-// runScraper attaches commodity-parsing callbacks to the collector and visits
-// targetURL.  Each matched name/price pair is written immediately to the
-// database, keeping memory usage constant regardless of page size.
-func runScraper(c *colly.Collector, db *sql.DB, targetURL string) {
-	// scrapeTime is set once per visit so all rows from a single run share the
-	// same timestamp, making it easy to group results by scrape session.
-	scrapeTime := time.Now()
-
-	// nameBuffer temporarily stores the commodity name found in NameSelector
-	// so it can be paired with the price found by PriceSelector.
+// runScraper registers commodity-parsing callbacks on c and visits each URL in
+// urls sequentially.  State (nameBuffer, scrapeTime) is reset at the start of
+// every request so multiple URLs do not bleed into each other.
+//
+// A fresh collector (from newCollector) should be passed on each call so that
+// callbacks are only registered once per collector instance.
+func runScraper(c *colly.Collector, db *sql.DB, urls []string) {
+	// nameBuffer temporarily holds the commodity name from NameSelector so it
+	// can be paired with the next PriceSelector element.
+	//
+	// scrapeTime is reset per-request so each URL's rows carry the timestamp of
+	// when that specific page was fetched.
 	//
 	// NOTE: This simple pairing assumes the HTML layout alternates name/price
 	// cells in document order (e.g. a two-column table).  Adjust the selectors
 	// and pairing logic if the target page has a different structure.
-	var nameBuffer string
+	var (
+		nameBuffer string
+		scrapeTime time.Time
+	)
+
+	// Reset per-URL state at the beginning of each request so leftover values
+	// from a previous URL do not contaminate the next one.
+	// Access to nameBuffer and scrapeTime is safe without a mutex because
+	// Parallelism is set to 1 in newCollector, ensuring all Colly callbacks
+	// execute sequentially on a single goroutine.
+	c.OnRequest(func(r *colly.Request) {
+		scrapeTime = time.Now()
+		nameBuffer = ""
+	})
 
 	// OnHTML fires for every element matching NameSelector.
 	// We save the text content so the paired price handler can use it.
 	c.OnHTML(NameSelector, func(e *colly.HTMLElement) {
-		// Text() trims surrounding whitespace automatically.
 		nameBuffer = e.Text
 	})
 
@@ -224,15 +310,17 @@ func runScraper(c *colly.Collector, db *sql.DB, targetURL string) {
 		nameBuffer = ""
 	})
 
-	// OnScraped fires after the page has been fully processed.
+	// OnScraped fires after each page has been fully processed.
 	c.OnScraped(func(r *colly.Response) {
 		log.Printf("finished scraping %s", r.Request.URL)
 	})
 
-	// Visit triggers the request; OnHTML callbacks run synchronously before
-	// Visit returns, so the database is fully populated when Visit exits.
-	if err := c.Visit(targetURL); err != nil {
-		log.Printf("visit error: %v", err)
+	// Visit each configured URL in turn.  Errors are logged but do not stop
+	// the remaining URLs from being scraped.
+	for _, u := range urls {
+		if err := c.Visit(u); err != nil {
+			log.Printf("visit error for %s: %v", u, err)
+		}
 	}
 }
 
@@ -242,9 +330,7 @@ func runScraper(c *colly.Collector, db *sql.DB, targetURL string) {
 
 func main() {
 	// Seed the package-level random source used for User-Agent rotation.
-	// Without seeding, the same sequence repeats each run, defeating the
-	// randomisation goal.  math/rand is sufficient; no cryptographic
-	// randomness is needed here.
+	// math/rand is sufficient; no cryptographic randomness is needed here.
 	rng = rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec
 
 	// Open (or create) the SQLite database and ensure the schema exists.
@@ -256,24 +342,55 @@ func main() {
 
 	log.Printf("database ready: %s", DBFile)
 
-	// Check whether the target URL has been configured.  If it is still the
-	// placeholder, warn the operator but proceed so the rest of the code can
-	// be tested against a real URL supplied via an environment variable.
-	targetURL := TargetURL
-	if envURL := os.Getenv("SCRAPER_TARGET_URL"); envURL != "" {
-		targetURL = envURL
-		log.Printf("using target URL from SCRAPER_TARGET_URL: %s", targetURL)
-	} else if targetURL == "https://example.com/commodities" {
-		log.Println("WARNING: TargetURL is still the placeholder. " +
-			"Set SCRAPER_TARGET_URL or update the TargetURL constant before running in production.")
+	// Determine which URLs to scrape and how often to repeat.
+	urls := resolveURLs()
+	interval := resolveInterval()
+
+	// runCycle performs one full scrape of all configured URLs using a fresh
+	// Colly collector.  Creating a new collector each cycle ensures that
+	// OnHTML/OnRequest callbacks are registered exactly once per run and that
+	// no state leaks between cycles.
+	runCycle := func() {
+		log.Printf("starting scrape cycle (%d URL(s))…", len(urls))
+		c := newCollector()
+		runScraper(c, db, urls)
+		log.Println("scrape cycle complete")
 	}
 
-	// Build the Colly collector with rate-limiting and User-Agent rotation.
-	c := newCollector()
+	// Always run once immediately on startup so there is no initial wait.
+	runCycle()
 
-	// Register CSS-selector callbacks and visit the target page.
-	// All database writes happen inside runScraper.
-	runScraper(c, db, targetURL)
+	// If interval is 0, run-once mode: exit after the first cycle.
+	// This is useful when an external scheduler (e.g. cron, systemd timer)
+	// manages the cadence instead of the built-in scheduler.
+	if interval == 0 {
+		log.Println("SCRAPER_INTERVAL=0 – run-once mode, exiting")
+		return
+	}
 
-	log.Println("scrape complete")
+	// Built-in scheduler: repeat every interval until SIGINT or SIGTERM.
+	log.Printf("scheduler active – repeating every %v (send SIGINT/SIGTERM to stop)", interval)
+
+	// Listen for OS shutdown signals so the process exits cleanly when the VPS
+	// operator runs `systemctl stop scraper` or presses Ctrl+C.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			// Interval elapsed – run the next scrape cycle.
+			runCycle()
+			log.Printf("next run scheduled at %s", time.Now().Add(interval).Format(time.RFC3339))
+
+		case sig := <-stop:
+			// Shutdown signal received – stop the scheduler gracefully.
+			log.Printf("received signal %v – stopping scheduler", sig)
+			return
+		}
+	}
 }
+
